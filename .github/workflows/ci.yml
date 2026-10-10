@@ -12,7 +12,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A run started by hand publishes like a main run. Given a tag, it makes a
+  # release under that tag and title instead of a nightly (`publish`).
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag for a release of this commit, such as v0.1.0. Empty publishes a nightly."
+        type: string
+        default: ""
+      title:
+        description: "The release's title, such as LosOS 0.1. Empty uses the tag."
+        type: string
+        default: ""
 
 # Read-only by default, because a pull request's run executes branch code. The
 # jobs that write ask for it themselves.
@@ -657,7 +668,7 @@ jobs:
   # The one check branch protection looks for, so a skipped or cancelled job
   # never reads as green.
   ci:
-    needs: [prebuild, flake, format, proxy]
+    needs: [prebuild, flake, format, proxy, release-name]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -668,24 +679,66 @@ jobs:
           FLAKE: ${{ needs.flake.result }}
           FORMAT: ${{ needs.format.result }}
           PROXY: ${{ needs.proxy.result }}
+          RELEASE_NAME: ${{ needs.release-name.result }}
         run: |
           test "$PREBUILD" = success
           test "$FLAKE" = success
           test "$FORMAT" = success
           test "$PROXY" = success
+          # Skipped unless a run started by hand names a tag.
+          test "$RELEASE_NAME" != failure
 
-  # Replaces the nightly GitHub release and moves the channel's tag in GHCR.
-  # sysupdate reads the OS's files through proxy/ because GitHub releases
-  # reject assets of 2 GiB or larger, so the release carries only the
-  # installer ISOs and the Windows installer, which are what a person
-  # downloads by hand. Only an
+  # A tag given to a run started by hand is checked before anything is
+  # built, so a name that is malformed or already released fails in seconds
+  # rather than after the build. `ci` requires it, and `publish` waits on it.
+  release-name:
+    if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          # A git ref name that is also a plain release asset URL segment.
+          # nightly- names belong to the nightlies, which a hand-made tag
+          # would otherwise take before its run did.
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] || [[ "$TAG" == *..* ]]; then
+            echo "::error::'$TAG' is not a tag name: letters, digits, '.', '_' and '-', starting with a letter or digit."
+            exit 1
+          fi
+          if [[ "$TAG" == nightly* ]]; then
+            echo "::error::Tags starting with 'nightly' are the nightlies'. Pick another name."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
+            echo "::error::$TAG is already released, and a release is never edited."
+            exit 1
+          fi
+
+  # Moves the channel's tag in GHCR and publishes the run as its own GitHub
+  # release, tagged `nightly-<YYYYMMDD>T<HHMM>` from the commit's time (the
+  # version every file name carries, flake.nix) and marked a prerelease.
+  # sysupdate keeps reading the channel tag through proxy/; the release is the
+  # same artifacts for a person to download, pinned to the commit. Only an
   # architecture that finished its build and passed its flake check reached
   # GHCR, so that is the gate. A failed VM test is not part of it (`flake`).
+  #
+  # Each release is created once and never edited afterwards, which is what
+  # lets the repository make releases immutable. That is also why there is no
+  # moving `nightly` release any more: GitHub refuses to reuse the tag of a
+  # deleted immutable release, so one could not be replaced.
+  #
+  # A run started by hand with a tag publishes the same files as a release
+  # under that tag and title instead, not a prerelease, and leaves the
+  # channel's tags alone: installed systems keep following the nightlies,
+  # and the release is a pinned copy of one.
   publish:
-    needs: [push]
-    if: always() && needs.push.result == 'success'
+    needs: [push, release-name]
+    if: always() && needs.push.result == 'success' && needs.release-name.result != 'failure'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: write
       packages: write
@@ -699,80 +752,130 @@ jobs:
         id: pulled
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
         run: |
+          # A run publishes both architectures or neither: a release with one
+          # missing could never gain it later, since it is not edited.
+          if ! [ -f refs/release-ref-x86_64.txt ] || ! [ -f refs/release-ref-aarch64.txt ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Only some architectures reached GHCR, so no nightly is published."
+            exit 0
+          fi
           printf '%s' "$GHCR_TOKEN" \
             | oras login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          mkdir -p release
-          : > sums
           for arch in x86_64 aarch64; do
-            ref="refs/release-ref-$arch.txt"
-            [ -f "$ref" ] || continue
-            oras pull "$(cat "$ref")" --output "pulled/$arch"
-            cat "pulled/$arch/SHA256SUMS" >> sums
-            # Each architecture's SHA256SUMS.gpg signs only that
-            # architecture's manifest, and the GitHub release carries neither
-            # (sysupdate fetches both from GHCR), so it stays behind. Moving it
-            # made the second architecture's `mv -n` refuse to replace the
-            # first's and fail the job.
-            find "pulled/$arch" -type f ! -name SHA256SUMS ! -name SHA256SUMS.gpg ! -name .version \
-              -exec mv -n -t release {} +
+            oras pull "$(cat "refs/release-ref-$arch.txt")" --output "pulled/$arch"
           done
-          # Every file name carries its architecture, so the two manifests
-          # merge by concatenation. sysupdate reads one SHA256SUMS per channel.
-          sort -u -k2 sums > release/SHA256SUMS
-          # The step below deletes the old release before creating the new
-          # one. Publishing with one architecture missing would delete that
-          # architecture's last good files while its GHCR tag still pointed
-          # at them, so a run publishes both or neither.
-          if [ -f refs/release-ref-x86_64.txt ] && [ -f refs/release-ref-aarch64.txt ]; then
-            echo "any=true" >> "$GITHUB_OUTPUT"
-            ls -l release
-          else
-            echo "any=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Only some architectures reached GHCR, so the nightly release stays as it was."
+          # The UKI's name is <id>_<version>_<arch>.efi on both architectures,
+          # and both were built from this commit, so they agree.
+          versions=$(sed -En 's/^[0-9a-f]+  .*_([0-9]{8}\.[0-9]{6})_(x86_64|aarch64)\.efi$/\1/p' \
+            pulled/*/SHA256SUMS | sort -u)
+          if [ "$(printf '%s\n' "$versions" | grep -c .)" != 1 ]; then
+            echo "::error::Expected one version across the architectures, found: ${versions:-none}"
+            exit 1
           fi
+          # 20261010.175322 is tagged nightly-20261010T1753, unless the run
+          # was started by hand with a tag (release-name checked it).
+          if [ -n "$TAG" ]; then
+            tag=$TAG title=${TITLE:-$TAG} nightly=false
+          else
+            tag=nightly-${versions:0:8}T${versions:9:4} title="LosOS nightly $versions" nightly=true
+          fi
+          # A title is one line, so it cannot add outputs of its own.
+          title=${title//[$'\r\n']/ }
+          {
+            echo "version=$versions"
+            echo "tag=$tag"
+            echo "title=$title"
+            echo "nightly=$nightly"
+            echo "any=true"
+          } >> "$GITHUB_OUTPUT"
 
       # proxy/ serves `images:nightly-<arch>` at /updates/nightly/<arch>/, so
       # the tag moves only here, to the artifact the release below is made of.
       - name: Move the channel tags in GHCR
-        if: steps.pulled.outputs.any == 'true'
+        if: steps.pulled.outputs.any == 'true' && steps.pulled.outputs.nightly == 'true'
         run: |
           for arch in x86_64 aarch64; do
-            ref="refs/release-ref-$arch.txt"
-            [ -f "$ref" ] || continue
-            oras tag "$(cat "$ref")" "nightly-$arch"
+            oras tag "$(cat "refs/release-ref-$arch.txt")" "nightly-$arch"
           done
 
-      # The release tag stays the channel name; update images come from the
-      # channel tags in GHCR via proxy/. The installer ISOs and the Windows
-      # installer (x86_64 only, docs/windows-installer.md) are attached with
-      # their own lines of SHA256SUMS. The tag is deleted with the release and
-      # made again at this commit, so it names the source they were built
-      # from. An installer at GitHub's limit fails the step rather than
-      # publishing a release without it.
-      - name: Publish to the channel release
+      # The release carries every file of both architectures except the
+      # qcow2 images, which are the disk image again uncompressed (6 GB each,
+      # `qemu-img convert` makes one from the .raw.xz). Each architecture's
+      # SHA256SUMS goes with its signature, renamed by architecture because
+      # both are called SHA256SUMS; the signature covers the bytes, not the
+      # name. GitHub rejects an asset of 2 GiB or more, and /usr and the disk
+      # image are already past it, so such a file goes up in 2000 MiB parts
+      # named <file>.part-00 on, which `cat` joins back into the file its line
+      # of SHA256SUMS names.
+      - name: Publish the release
         if: steps.pulled.outputs.any == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pulled.outputs.tag }}
+          TITLE: ${{ steps.pulled.outputs.title }}
+          NIGHTLY: ${{ steps.pulled.outputs.nightly }}
+          VERSION: ${{ steps.pulled.outputs.version }}
+          PROXY_URL: ${{ vars.LOSOS_PROXY_URL }}
         run: |
-          shopt -s nullglob
-          isos=(release/*-installer.iso)
-          if [ ${#isos[@]} = 0 ]; then
-            echo "::error::The release has no installer ISO."
-            exit 1
-          fi
-          installers=("${isos[@]}" release/*-windows-installer.exe)
-          for file in "${installers[@]}"; do
-            if [ "$(stat -c %s "$file")" -ge $((2 * 1024 * 1024 * 1024)) ]; then
-              echo "::error::$file is 2 GiB or larger, which a GitHub release rejects."
+          # A tag is published once. A re-run of this commit finds its
+          # release there and stops; only a draft, which an upload that died
+          # half-way leaves behind and which is not yet immutable, is
+          # replaced.
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != true ] && [ "$NIGHTLY" = true ]; then
+              echo "::notice::$TAG is already published, and a release is never edited."
+              exit 0
+            elif [ "$draft" != true ]; then
+              echo "::error::$TAG was released while this run built, and a release is never edited."
               exit 1
             fi
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          shopt -s nullglob
+          mkdir assets
+          for arch in x86_64 aarch64; do
+            dir=pulled/$arch
+            mv "$dir/SHA256SUMS" "assets/SHA256SUMS-$arch"
+            mv "$dir/SHA256SUMS.gpg" "assets/SHA256SUMS-$arch.gpg"
+            rm -f "$dir"/*.qcow2 "$dir/.version"
+            # The two architectures share no file name but these, since
+            # every other name carries its architecture or is x86_64's alone.
+            # rmdir fails the step if one ever did and was left behind.
+            mv -n -t assets "$dir"/*
+            rmdir "$dir"
           done
-          mkdir -p assets
-          mv -t assets "${installers[@]}"
-          grep -E -- '-installer\.iso$|-windows-installer\.exe$' release/SHA256SUMS > assets/SHA256SUMS
-          gh release delete nightly --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create nightly --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "LosOS nightly" --prerelease \
-            --notes "Rolling nightly channel. Write an installer ISO to a USB stick and boot it with UEFI, or run the Windows installer on a PC that keeps Windows; either installs the newest nightly over the network." \
+          isos=(assets/*-installer.iso)
+          if [ ${#isos[@]} != 2 ]; then
+            echo "::error::Expected an installer ISO per architecture, found ${#isos[@]}."
+            exit 1
+          fi
+          limit=$((2 * 1024 * 1024 * 1024))
+          for file in assets/*; do
+            if [ "$(stat -c %s "$file")" -ge "$limit" ]; then
+              split --bytes=2000MiB --numeric-suffixes --suffix-length=2 "$file" "$file.part-"
+              rm "$file"
+              parts=("$file".part-*)
+              echo "Split $(basename "$file") into ${#parts[@]} parts."
+            fi
+          done
+          ls -l assets
+          cat > notes.md <<NOTES
+          Built from $GITHUB_SHA, version \`$VERSION\`, for x86_64 and aarch64.
+
+          - **Install:** write \`*-installer.iso\` to a USB stick and boot it, or run the Windows installer on a PC that keeps Windows. Either installs the newest nightly over the network, which need not be this version.
+          - **Update images:** the UKI (\`.efi\`) and the two halves of \`/usr\` (\`_usr-*.raw.xz\`) are what systemd-sysupdate installs. Installed systems fetch them from \`${PROXY_URL%/}/updates/nightly/<arch>/\`, which serves the newest nightly; these are the same files, pinned to this version.
+          - **Disk image:** \`<arch>.raw.xz\`. Unpack it and write it to a disk, or convert it for a VM with \`qemu-img convert -O qcow2\`.
+          - **Files of 2 GiB or more** are split into \`.part-00\`, \`.part-01\` and on, because GitHub rejects larger assets. \`cat <file>.part-* > <file>\` joins one.
+          - **Checking:** \`SHA256SUMS-<arch>\` lists that architecture's files and \`SHA256SUMS-<arch>.gpg\` signs it with the [update signing key]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/nixos/keys/update-signing.asc). \`gpg --verify SHA256SUMS-<arch>.gpg SHA256SUMS-<arch>\`, then \`sha256sum --check --ignore-missing SHA256SUMS-<arch>\`.
+          NOTES
+          # gh creates the release as a draft, uploads every asset and only
+          # then publishes it, so an immutable release is never published
+          # with files still missing.
+          prerelease=()
+          [ "$NIGHTLY" = true ] && prerelease=(--prerelease)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TITLE" "${prerelease[@]}" --notes-file notes.md \
             assets/*
