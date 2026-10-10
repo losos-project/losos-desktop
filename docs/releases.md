@@ -38,6 +38,15 @@ releases immutable. A re-run of the same commit finds its tag taken and
 publishes nothing. There is no moving `nightly` release: GitHub refuses to
 reuse the tag of a deleted immutable release, so it could not be replaced.
 
+A tagged release is a run of `ci` started by hand (Actions, ci, Run
+workflow) on the commit to release, with a **tag** such as `v0.1.0` and a
+**title** such as `LosOS 0.1`. The run checks the tag first and fails within
+a minute if it is malformed, starts with `nightly`, or is already released.
+Otherwise it builds the commit, mostly from the cache, and publishes the same
+files as a nightly would, as a full release rather than a prerelease. It
+leaves the channel's GHCR tags alone, so installed systems keep following
+the nightlies. A run started by hand without a tag publishes a nightly.
+
 ![CI pushes store paths, releases and compiler caches to GHCR; the proxy redirects Nix, sysupdate and CI to GHCR's storage and streams the GSI's files to the web flasher; each nightly is also a GitHub release](images/binary-cache.svg)
 
 The `/usr` halves are cut out of the finished disk image at the offsets repart

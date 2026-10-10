@@ -12,7 +12,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A run started by hand publishes like a main run. Given a tag, it makes a
+  # release under that tag and title instead of a nightly (`publish`).
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag for a release of this commit, such as v0.1.0. Empty publishes a nightly."
+        type: string
+        default: ""
+      title:
+        description: "The release's title, such as LosOS 0.1. Empty uses the tag."
+        type: string
+        default: ""
 
 # Read-only by default, because a pull request's run executes branch code. The
 # jobs that write ask for it themselves.
@@ -657,7 +668,7 @@ jobs:
   # The one check branch protection looks for, so a skipped or cancelled job
   # never reads as green.
   ci:
-    needs: [prebuild, flake, format, proxy]
+    needs: [prebuild, flake, format, proxy, release-name]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -668,11 +679,43 @@ jobs:
           FLAKE: ${{ needs.flake.result }}
           FORMAT: ${{ needs.format.result }}
           PROXY: ${{ needs.proxy.result }}
+          RELEASE_NAME: ${{ needs.release-name.result }}
         run: |
           test "$PREBUILD" = success
           test "$FLAKE" = success
           test "$FORMAT" = success
           test "$PROXY" = success
+          # Skipped unless a run started by hand names a tag.
+          test "$RELEASE_NAME" != failure
+
+  # A tag given to a run started by hand is checked before anything is
+  # built, so a name that is malformed or already released fails in seconds
+  # rather than after the build. `ci` requires it, and `publish` waits on it.
+  release-name:
+    if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          # A git ref name that is also a plain release asset URL segment.
+          # nightly- names belong to the nightlies, which a hand-made tag
+          # would otherwise take before its run did.
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] || [[ "$TAG" == *..* ]]; then
+            echo "::error::'$TAG' is not a tag name: letters, digits, '.', '_' and '-', starting with a letter or digit."
+            exit 1
+          fi
+          if [[ "$TAG" == nightly* ]]; then
+            echo "::error::Tags starting with 'nightly' are the nightlies'. Pick another name."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
+            echo "::error::$TAG is already released, and a release is never edited."
+            exit 1
+          fi
 
   # Moves the channel's tag in GHCR and publishes the run as its own GitHub
   # release, tagged `nightly-<YYYYMMDD>T<HHMM>` from the commit's time (the
@@ -686,9 +729,14 @@ jobs:
   # lets the repository make releases immutable. That is also why there is no
   # moving `nightly` release any more: GitHub refuses to reuse the tag of a
   # deleted immutable release, so one could not be replaced.
+  #
+  # A run started by hand with a tag publishes the same files as a release
+  # under that tag and title instead, not a prerelease, and leaves the
+  # channel's tags alone: installed systems keep following the nightlies,
+  # and the release is a pinned copy of one.
   publish:
-    needs: [push]
-    if: always() && needs.push.result == 'success'
+    needs: [push, release-name]
+    if: always() && needs.push.result == 'success' && needs.release-name.result != 'failure'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -704,6 +752,8 @@ jobs:
         id: pulled
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
         run: |
           # A run publishes both architectures or neither: a release with one
           # missing could never gain it later, since it is not edited.
@@ -725,17 +775,27 @@ jobs:
             echo "::error::Expected one version across the architectures, found: ${versions:-none}"
             exit 1
           fi
-          # 20261010.175322 is tagged nightly-20261010T1753.
+          # 20261010.175322 is tagged nightly-20261010T1753, unless the run
+          # was started by hand with a tag (release-name checked it).
+          if [ -n "$TAG" ]; then
+            tag=$TAG title=${TITLE:-$TAG} nightly=false
+          else
+            tag=nightly-${versions:0:8}T${versions:9:4} title="LosOS nightly $versions" nightly=true
+          fi
+          # A title is one line, so it cannot add outputs of its own.
+          title=${title//[$'\r\n']/ }
           {
             echo "version=$versions"
-            echo "tag=nightly-${versions:0:8}T${versions:9:4}"
+            echo "tag=$tag"
+            echo "title=$title"
+            echo "nightly=$nightly"
             echo "any=true"
           } >> "$GITHUB_OUTPUT"
 
       # proxy/ serves `images:nightly-<arch>` at /updates/nightly/<arch>/, so
       # the tag moves only here, to the artifact the release below is made of.
       - name: Move the channel tags in GHCR
-        if: steps.pulled.outputs.any == 'true'
+        if: steps.pulled.outputs.any == 'true' && steps.pulled.outputs.nightly == 'true'
         run: |
           for arch in x86_64 aarch64; do
             oras tag "$(cat "refs/release-ref-$arch.txt")" "nightly-$arch"
@@ -750,11 +810,13 @@ jobs:
       # image are already past it, so such a file goes up in 2000 MiB parts
       # named <file>.part-00 on, which `cat` joins back into the file its line
       # of SHA256SUMS names.
-      - name: Publish the nightly release
+      - name: Publish the release
         if: steps.pulled.outputs.any == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.pulled.outputs.tag }}
+          TITLE: ${{ steps.pulled.outputs.title }}
+          NIGHTLY: ${{ steps.pulled.outputs.nightly }}
           VERSION: ${{ steps.pulled.outputs.version }}
           PROXY_URL: ${{ vars.LOSOS_PROXY_URL }}
         run: |
@@ -763,9 +825,12 @@ jobs:
           # half-way leaves behind and which is not yet immutable, is
           # replaced.
           if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
-            if [ "$draft" != true ]; then
+            if [ "$draft" != true ] && [ "$NIGHTLY" = true ]; then
               echo "::notice::$TAG is already published, and a release is never edited."
               exit 0
+            elif [ "$draft" != true ]; then
+              echo "::error::$TAG was released while this run built, and a release is never edited."
+              exit 1
             fi
             gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
           fi
@@ -798,9 +863,9 @@ jobs:
           done
           ls -l assets
           cat > notes.md <<NOTES
-          The nightly built from $GITHUB_SHA, version \`$VERSION\`, for x86_64 and aarch64.
+          Built from $GITHUB_SHA, version \`$VERSION\`, for x86_64 and aarch64.
 
-          - **Install:** write \`*-installer.iso\` to a USB stick and boot it, or run the Windows installer on a PC that keeps Windows. Either installs the newest nightly over the network.
+          - **Install:** write \`*-installer.iso\` to a USB stick and boot it, or run the Windows installer on a PC that keeps Windows. Either installs the newest nightly over the network, which need not be this version.
           - **Update images:** the UKI (\`.efi\`) and the two halves of \`/usr\` (\`_usr-*.raw.xz\`) are what systemd-sysupdate installs. Installed systems fetch them from \`${PROXY_URL%/}/updates/nightly/<arch>/\`, which serves the newest nightly; these are the same files, pinned to this version.
           - **Disk image:** \`<arch>.raw.xz\`. Unpack it and write it to a disk, or convert it for a VM with \`qemu-img convert -O qcow2\`.
           - **Files of 2 GiB or more** are split into \`.part-00\`, \`.part-01\` and on, because GitHub rejects larger assets. \`cat <file>.part-* > <file>\` joins one.
@@ -809,6 +874,8 @@ jobs:
           # gh creates the release as a draft, uploads every asset and only
           # then publishes it, so an immutable release is never published
           # with files still missing.
+          prerelease=()
+          [ "$NIGHTLY" = true ] && prerelease=(--prerelease)
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "LosOS nightly $VERSION" --prerelease --notes-file notes.md \
+            --title "$TITLE" "${prerelease[@]}" --notes-file notes.md \
             assets/*

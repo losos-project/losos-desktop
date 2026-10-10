@@ -148,7 +148,9 @@ one made in GitHub's web editor. `push` uploads it to
 GHCR. It is the only job holding `packages: write` beside release files, and
 it checks out no code. `publish` moves the `images:nightly-<arch>` tag that
 `proxy/` serves updates from and creates that run's own prerelease,
-`nightly-<YYYYMMDD>T<HHMM>`, with both architectures' files (`docs/releases.md`).
+`nightly-<YYYYMMDD>T<HHMM>`, with both architectures' files; a run started
+by hand with a `tag` and `title` publishes a release under those instead
+(`docs/releases.md`).
 `proxy` tests the proxy and deploys nothing. `ci` is the check branch
 protection reads. `docs.yml` builds the site and the wiki pages on a pull
 request, and from main deploys the site to Pages and pushes the wiki.
