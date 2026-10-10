@@ -20,15 +20,16 @@ fetches. It serves these from this project's GHCR namespace:
   `images:<channel>-<arch>`, which CI's publish job moves to each release
   that passed verification. CI sets `losos.update.baseUrl` to
   `<proxy>/updates/<channel>/<arch>/`, so sysupdate fetches manifests and
-  images through the proxy. The GitHub nightly release is announcement-only:
-  GitHub rejects release assets of 2 GiB or larger.
+  images through the proxy. Each nightly is also a GitHub release of its own
+  ([Releases](releases.md)), but that splits files of 2 GiB or more into
+  parts, which sysupdate could not fetch.
 - **The web flasher's files.** `/flasher/<channel>/<arch>/<file>` serves the
   same release's `_gsi-` files and `SHA256SUMS`, streamed one byte range at a
   time rather than redirected, because a page on another origin cannot read
   GHCR's storage ([Web flasher](web-flasher.md)). Every read the proxy answers
   says `Access-Control-Allow-Origin: *`.
 
-![CI pushes store paths, releases and compiler caches to GHCR; the proxy redirects Nix, sysupdate and CI to GHCR's storage and streams the GSI's files to the web flasher; the nightly GitHub release carries only the installers](images/binary-cache.svg)
+![CI pushes store paths, releases and compiler caches to GHCR; the proxy redirects Nix, sysupdate and CI to GHCR's storage and streams the GSI's files to the web flasher; each nightly is also a GitHub release](images/binary-cache.svg)
 
 To use it for a build:
 

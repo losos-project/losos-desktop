@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" width="900" height="420" role="img">
 <title>From CI to every machine: GHCR, the proxy and what reads through it</title>
-<desc>CI pushes store paths, releases and compiler caches to GHCR. The proxy, a Vercel edge function, answers Nix, systemd-sysupdate, the web flasher and CI itself: it redirects to GHCR storage for NARs, updates and build caches, and streams the GSI files to the flasher, which cannot read GHCR across origins. The publish job also puts the installers on the nightly GitHub release.</desc>
+<desc>CI pushes store paths, releases and compiler caches to GHCR. The proxy, a Vercel edge function, answers Nix, systemd-sysupdate, the web flasher and CI itself: it redirects to GHCR storage for NARs, updates and build caches, and streams the GSI files to the flasher, which cannot read GHCR across origins. The publish job also puts each nightly on a GitHub release of its own.</desc>
 <style>
 text { font-family: Inter, "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; font-size: 14px; fill: #e5e7eb; }
 .b { font-weight: 600; }
@@ -74,7 +74,7 @@ text { font-family: Inter, "Segoe UI", system-ui, -apple-system, "Helvetica Neue
 <text x="787.5" y="321.0" class="s" text-anchor="middle">tools/build-cache-fetch</text>
 <path d="M633,309 L693,309" fill="none" stroke="#fbbf24" stroke-width="1.6" marker-end="url(#hfbbf24)"/>
 <rect x="25" y="362" width="400" height="40" rx="8" fill="#172033" stroke="#3b4a63" stroke-width="1.5" stroke-dasharray="5 4"/>
-<text x="225.0" y="386.5" class="s" text-anchor="middle">The nightly GitHub release: the installers only</text>
+<text x="225.0" y="386.5" class="s" text-anchor="middle">A prerelease per nightly: nightly-&lt;YYYYMMDD&gt;T&lt;HHMM&gt;</text>
 <path d="M105,340 L105,360" fill="none" stroke="#a3e635" stroke-width="1.6" marker-end="url(#ha3e635)"/>
 <text x="470" y="380" class="s">A redirect sends the client to GHCR's storage,</text>
 <text x="470" y="396" class="s">so those bytes never pass through the proxy.</text>

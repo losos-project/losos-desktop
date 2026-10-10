@@ -18,14 +18,27 @@ SHA256SUMS
 
 CI pushes it to GHCR as one OCI artifact per architecture with `oras`, and
 `proxy/` serves the newest one to sysupdate, which cannot fetch from an OCI
-registry itself (see [Binary cache](binary-cache.md)). The publish job then replaces the
-`nightly` GitHub release with the installer ISOs, the
-[Windows installer](windows-installer.md) and their lines of `SHA256SUMS`,
-and nothing else: GitHub rejects release assets of 2 GiB or more, which
-`/usr` and the disk image are not far from, and the installers are what a
-person downloads by hand.
+registry itself (see [Binary cache](binary-cache.md)). The publish job then
+creates a GitHub release of its own for that run, tagged
+`nightly-<YYYYMMDD>T<HHMM>` from the version (`20261010.175322` is
+`nightly-20261010T1753`) and marked a prerelease. It carries both
+architectures' files, the update images, disk images, installer ISOs and the
+[Windows installer](windows-installer.md), all but the qcow2 images, which
+are the disk image again uncompressed. Each architecture's signed manifest
+goes beside them as `SHA256SUMS-<arch>` and `SHA256SUMS-<arch>.gpg`.
 
-![CI pushes store paths, releases and compiler caches to GHCR; the proxy redirects Nix, sysupdate and CI to GHCR's storage and streams the GSI's files to the web flasher; the nightly GitHub release carries only the installers](images/binary-cache.svg)
+GitHub rejects a release asset of 2 GiB or more, and `/usr` and the disk
+image are past that, so such a file is uploaded in 2000 MiB parts,
+`<file>.part-00` on; `cat <file>.part-* > <file>` gives back the file its line
+of `SHA256SUMS-<arch>` names. That is also why sysupdate keeps reading
+through the proxy rather than from the release.
+
+A release is created once and never edited, so the repository can make
+releases immutable. A re-run of the same commit finds its tag taken and
+publishes nothing. There is no moving `nightly` release: GitHub refuses to
+reuse the tag of a deleted immutable release, so it could not be replaced.
+
+![CI pushes store paths, releases and compiler caches to GHCR; the proxy redirects Nix, sysupdate and CI to GHCR's storage and streams the GSI's files to the web flasher; each nightly is also a GitHub release](images/binary-cache.svg)
 
 The `/usr` halves are cut out of the finished disk image at the offsets repart
 reported, not built a second time, so the bytes sysupdate installs are the
